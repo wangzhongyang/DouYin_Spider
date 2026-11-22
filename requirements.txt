@@ -28,3 +28,5 @@ blackboxprotobuf
 backports.zstd ; python_version<'3.14'
 rocksdict==0.3.29
 jsbeautifier==2.0.3
+# 直播间事件上报（dy_live/event_sink.py）
+redis

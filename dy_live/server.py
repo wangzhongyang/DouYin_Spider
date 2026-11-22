@@ -35,6 +35,7 @@ from utils.dy_util import generate_signature
 
 from dy_live.utils import *
 from dy_live.user_db import UserDB, gatherUsers
+from dy_live.event_sink import RedisEventSink, clean_text, parse_log_time
 
 ZWSP = '\u200b'  # Zero Width Space
 
@@ -86,6 +87,11 @@ class DouyinLive:
         self.live_name = ''
         self.user_db: UserDB = None
         self.cond_stopped = threading.Condition()
+
+        # 直播间事件旁路：结构化事件写 Redis，文本日志完全不受影响
+        self.event_sink: RedisEventSink | None = RedisEventSink.from_env()
+        # 由 on_message / _replay 更新，handler 里发事件时用它当时间戳
+        self._last_ts = None
 
         self.muted_messages: list[str] = []
         names = [l.split('#')[0] for l in self.read_file_if_exist('dy_live/muted_messages').splitlines()]
@@ -158,10 +164,49 @@ class DouyinLive:
     def log_txt(self, *values: object, sep: str | None = " ", end: str | None = "\n"):
         if self._log_txt:
             print(*values, sep=sep, end=end, file=self.txt_log_file)
+            # 同时打到终端，前台运行时能直接看到弹幕/礼物/进场
+            print(*values, sep=sep, end=end, flush=True)
 
     def log_json(self, *values: object, sep: str | None = " ", end: str | None = "\n"):
         if self._log_json:
             print(*values, sep=sep, end=end, file=self.json_log_file)
+
+    def emit_event(
+            self,
+            kind: str,
+            m: Message,
+            detail: str,
+            *,
+            user: str | None = None,
+            **payload,
+    ):
+        """把一条直播间事件投进 Redis；未启用时什么都不做。
+
+        kind 与 ai-games 的 src/pet/types.ts 约定一致：danmaku / gift / enter / follow
+        """
+        sink = self.event_sink
+        if sink is None:
+            return
+
+        common = getattr(m, 'common', None)
+        event_id = getattr(common, 'msg_id', None)
+        if not event_id:
+            method = getattr(common, 'method', '') or kind
+            event_id = f'{method}-{int(time.time() * 1000)}'
+
+        extra: dict[str, object] = {}
+        u = getattr(m, 'user', None)
+        if u is not None:
+            nickname = clean_text(getattr(u, 'nickname', '') or user)
+            extra['user'] = nickname or clean_text(user)
+            uid = getattr(u, 'id', None)
+            if uid:
+                extra['userId'] = str(uid)
+        elif user:
+            extra['user'] = clean_text(user)
+
+        extra.update({k: v for k, v in payload.items() if v is not None})
+        sink.emit(kind=kind, ts=self._last_ts, detail=detail, payload=extra, event_id=event_id)
 
     def nickname_or_id(self, id_: int | str) -> str:
         u = self.user_db[int(id_)]
@@ -172,9 +217,11 @@ class DouyinLive:
             self.cond_stopped.notify_all()
 
     def ping(self, ws: websocket.WebSocket):
+        # 抖音 webcast 服务端约 30 秒收不到上行就会断开，心跳必须比它快。
+        # 网页端实测是 10 秒一次 hb；原来写 60 秒会固定每 30 秒被踢一次。
         while True:
             with self.cond_stopped:
-                if self.cond_stopped.wait(timeout=60):
+                if self.cond_stopped.wait(timeout=10):
                     break
             try:
                 frame = transport.PushFrame(payload_type="hb")
@@ -235,6 +282,7 @@ class DouyinLive:
 
         # print time of the messages
         if len(response.messages) > 0:
+            self._last_ts = response.now
             self.log_json(format_readable_time(response.now, True))
             msgs = [m for m in response.messages if m.method.removeprefix('Webcast') not in self.muted_messages]
             if len(msgs) > 0:
@@ -458,6 +506,9 @@ class DouyinLive:
                         self.log_txt(json_)
 
             elif line[:4].isdigit():  # time stamp
+                parsed = parse_log_time(line)
+                if parsed is not None:
+                    self._last_ts = parsed
                 self.log_txt(line.rstrip())
 
     def _try_get_class(self, module, method: str):
@@ -524,11 +575,21 @@ class DouyinLive:
         badge = f"({u.pay_grade.level} {u.fans_club.data.level})"
         # ZWSP 是无宽度空格，避免用户昵称中的特殊字符导致后续文字显示错乱。
         self.log_txt(f"【聊天】{badge} {m.user.nickname}{ZWSP}：{m.content}")
+        self.emit_event('danmaku', m, m.content, badge=badge)
 
     def on_GiftMessage(self, m: Message):
         """礼物消息"""
         repeat_end_hint = '（连击结束）' if (m.repeat_end and m.combo_count > 1) else ''
         self.log_txt(f"【礼物】{m.user.nickname}{ZWSP} 送出了 {m.gift.name} ×{m.combo_count}{repeat_end_hint}")
+        # 连击期间会连续推很多条，只在「第一下」和「连击结束」各发一次，避免刷屏
+        if m.repeat_end or m.combo_count == 1:
+            suffix = f" ×{m.combo_count}" if m.combo_count > 1 else ''
+            self.emit_event(
+                'gift', m, f"送出 {m.gift.name}{suffix}",
+                gift=clean_text(m.gift.name),
+                count=int(m.combo_count),
+                comboEnd=bool(m.repeat_end),
+            )
 
     def on_BindingGiftMessage(self, m: Message):
         """礼物消息"""
@@ -562,6 +623,12 @@ class DouyinLive:
                 f"{u.pay_grade.level},{u.fans_club.data.level},"
                 f"{u.follow_info.following_count},{u.follow_info.follower_count}"
                 f") {render_text(m.common.display_text)}")  # “来了”、“通过 分享 来了”、“通过用户推荐来了”
+            self.emit_event(
+                'enter', m, f"{clean_text(u.nickname)} 来了",
+                gender=gender,
+                payGrade=int(u.pay_grade.level),
+                fansClub=int(u.fans_club.data.level),
+            )
         else:
             self.log_txt(f"【进场 action={m.action}】{render_text(m.common.display_text)} JSON={message_to_json(m)}")
 
@@ -569,6 +636,11 @@ class DouyinLive:
         """社交消息。关注、分享等"""
         follow_count_hint = f'。主播当前粉丝 {m.follow_count}' if m.action == 1 else ''
         self.log_txt(f"【社交】{render_text(m.common.display_text)}{follow_count_hint}")
+        if m.action == 1:
+            self.emit_event(
+                'follow', m, f"{clean_text(m.user.nickname)} 关注了主播",
+                followCount=int(m.follow_count),
+            )
 
     def on_RoomUserSeqMessage(self, m: Message):
         """直播间统计"""
@@ -1008,6 +1080,11 @@ class DouyinLive:
 
 
 if __name__ == '__main__':
+    # 同一个直播间只允许一个监听进程，重复启动直接退出
+    from dy_live.single_instance import acquire_single_instance
+
+    _lock = acquire_single_instance()
+
     # Live REST/WebSocket uses the same Auth session as the main-site APIs;
     # an explicit DY_LIVE_COOKIES remains an opt-in legacy override handled by
     # load_env().

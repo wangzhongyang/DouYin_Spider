@@ -24,7 +24,7 @@ LinkmicPlayModeUpdateScoreMessage
 LowPcuGuideMessage # 未知
 LuckyBoxEndMessage # 红包结束，仅含 box_id 信息
 LuckyBoxTempStatusMessage # 无可用信息 {"common": {"method": "WebcastLuckyBoxTempStatusMessage"}}
-MemberMessage # 成员消息，比如用户进入直播间 `on_MemberMessage`
+# MemberMessage # 成员消息，比如用户进入直播间 `on_MemberMessage`（已开启，进场会打印）
 PrizeNoticeMessage # 无可用信息 {"common": {"method": "WebcastPrizeNoticeMessage"}, "asset_id": "7424", "scene_context_id": "3", "play_priority": 35}
 ProfitGameStatusMessage # 无可用信息 {"common": {"method": "WebcastProfitGameStatusMessage"}, "status": 2, "game_extra": "{\"title\":\"游戏连屏中\"}", "track_info": {"link_game_id": "", "link_game_name": ""}, "channel_id": "7687665268155847722"}
 ProfitInteractionScoreMessage # 收益性互动分数？

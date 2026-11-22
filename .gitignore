@@ -58,3 +58,7 @@ datas
 live.*.log
 live.*.json
 live.*/
+
+# 单实例锁
+dy_live/.dy_live.lock
+.dy_live.lock
