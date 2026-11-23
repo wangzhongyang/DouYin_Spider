@@ -2002,13 +2002,134 @@ class DouyinAPI:
         return res.json()
 
     @staticmethod
-    def publish_comment(auth, aweme_id: str, content: str = '', reply_id="", **kwargs):
+    def get_custom_stickers(auth, cursor='0', page_size='500',
+                            source='comment', **kwargs) -> dict:
+        """拉取评论面板里的自定义表情（贴纸）列表。
+
+        参数顺序照 2026-11-23 Windows Chrome 抓包。注意这个接口的
+        `aid` / `app_id` 都是 **1128**，不是主站的 6383——混用会被判签名错误。
+
+        :return: {"stickers": [...], "next_cursor": int,
+                  "is_completed": bool, "raw": 原始 JSON}
+        """
+        api = '/aweme/v1/web/im/resource/list/aggregation'
+        refer = kwargs.get('referer') or 'https://www.douyin.com/user/self'
+        headers = HeaderBuilder().build(HeaderType.GET)
+        headers.set_referer(refer)
+        headers.set_header('accept', 'application/json, text/plain, */*')
+        headers.with_uifid(auth)
+        params = Params()
+        for key, value in (
+                ('device_platform', 'webapp'),
+                ('aid', '1128'),
+                ('channel', 'channel_pc_web'),
+                ('publish_video_strategy_type', '2'),
+                ('app_id', '1128'),
+                ('scenes', 'CUSTOM_STICKER_PAGE'),
+                ('custom_cursor', str(cursor)),
+                ('custom_page_size', str(page_size)),
+                ('source', source),
+                ('update_version_code', '170400'),
+                ('pc_client_type', '1'),
+                ('pc_libra_divert', 'Windows'),
+                ('support_h265', '1'),
+                ('support_dash', '1'),
+                ('cpu_core_num', get_profile()['cpu_core_num']),
+                ('version_code', '170400'),
+                ('version_name', '17.4.0'),
+                ('cookie_enabled', 'true'),
+                ('screen_width', get_profile()['screen_width']),
+                ('screen_height', get_profile()['screen_height']),
+                ('browser_language', 'zh-CN'),
+                ('browser_platform', 'Win32'),
+                ('browser_name', get_profile()['browser_name']),
+                ('browser_version', get_profile()['browser_version']),
+                ('browser_online', 'true'),
+                ('engine_name', 'Blink'),
+                ('engine_version', get_profile()['engine_version']),
+                ('os_name', 'Windows'),
+                ('os_version', '10'),
+                ('device_memory', get_profile()['device_memory']),
+                ('platform', 'PC'),
+                ('downlink', '10'),
+                ('effective_type', '4g'),
+                ('round_trip_time', '250'),
+        ):
+            params.add_param(key, value)
+        params.with_web_id(auth, refer)
+        params.with_uifid(auth)
+        params.with_verify_fp(auth)
+        params.add_param('msToken', auth.msToken)
+        params.with_a_bogus()
+        resp = requests.get(f'{DouyinAPI.douyin_url}{api}', headers=headers.get(),
+                            cookies=auth.cookie, params=params.get(), verify=False)
+        check_risk_response(resp)
+        data = resp.json()
+        page = data.get('custom_sticker_page_list') or {}
+        stickers = []
+        for resource in page.get('resources') or []:
+            stickers.extend(resource.get('stickers') or [])
+        return {
+            'stickers': stickers,
+            'next_cursor': page.get('next_cursor', 0),
+            'is_completed': page.get('is_completed'),
+            'raw': data,
+        }
+
+    @staticmethod
+    def _comment_sticker_fields(sticker: dict) -> dict:
+        """把评论表情对象映射成 comment/publish 的 sticker_* 表单字段。
+
+        字段名和取值来源对齐 PC Web 前端（2026-11-23 从 douyin-pc-web
+        chunk_36096 提取）：
+
+        ======================  ==================================
+        sticker_id              id_str
+        sticker_uri             animate_url.uri
+        sticker_width/height    width / height
+        sticker_type            sticker_type
+        sticker_format          animate_type
+        sticker_author_sec_uid  author.sec_uid（评论数据里是 author_sec_uid）
+        ======================  ==================================
+
+        评论列表返回的 sticker 对象可以直接传入；表情接口返回的对象也兼容。
+        缺失的字段不发送，避免用猜测值覆盖服务端默认。
+        """
+        if not isinstance(sticker, dict):
+            raise TypeError('sticker 必须是表情对象 dict')
+        animate = sticker.get('animate_url') or sticker.get('static_url') or {}
+        sticker_id = sticker.get('id_str') or sticker.get('id')
+        if not sticker_id:
+            raise ValueError('sticker 缺少 id/id_str')
+        if not animate.get('uri'):
+            raise ValueError('sticker 缺少 animate_url.uri（或 static_url.uri）')
+        author = sticker.get('author') or {}
+        fields = {
+            'sticker_id': str(sticker_id),
+            'sticker_uri': str(animate['uri']),
+            'sticker_width': int(sticker.get('width') or animate.get('width') or 0),
+            'sticker_height': int(sticker.get('height') or animate.get('height') or 0),
+            'sticker_type': sticker.get('sticker_type'),
+            # 自定义表情接口给 animate_type；已拼好的对象也可能直接带
+            # sticker_format（Windows 抓包实录值是 webp / gif）
+            'sticker_format': (sticker.get('animate_type')
+                               or sticker.get('sticker_format')),
+            'sticker_author_sec_uid': (sticker.get('author_sec_uid')
+                                       or author.get('sec_uid') or ''),
+        }
+        # 0 是合法的 sticker_type；只丢弃 None 和空串
+        return {k: v for k, v in fields.items() if v is not None and v != ''}
+
+    @staticmethod
+    def publish_comment(auth, aweme_id: str, content: str = '', reply_id="",
+                        sticker: dict = None, **kwargs):
         """
         发布评论
         :param auth: DouyinAuth object.
         :param aweme_id: 作品ID，或作品链接（同项目其它接口都收链接，这里两种都接受）.
-        :param content: 评论内容.
+        :param content: 评论内容；纯表情评论传空字符串.
         :param reply_id: 回复评论ID.
+        :param sticker: 评论表情对象（评论列表里的 sticker 字段），传了就发图片表情评论.
         :return: JSON.
         """
         api = "/aweme/v1/web/comment/publish"
@@ -2050,8 +2171,9 @@ class DouyinAPI:
         # 顺序与浏览器实测一致：verifyFp/fp 在 msToken 之前，a_bogus 之后只跟 uid
         params = Params()
         params.add_param("app_name", 'aweme')
-        params.add_param("enter_from", 'video_detail')
-        params.add_param("previous_page", 'video_detail')
+        # 从个人主页的作品弹窗发评论时浏览器传的是 personal_homepage
+        params.add_param("enter_from", kwargs.get('enter_from', 'video_detail'))
+        params.add_param("previous_page", kwargs.get('previous_page', 'video_detail'))
         params.add_param("device_platform", 'webapp')
         params.add_param("aid", '6383')
         params.add_param("channel", 'channel_pc_web')
@@ -2109,6 +2231,10 @@ class DouyinAPI:
         data["text_extra"] = (text_extra if isinstance(text_extra, str) else
                                json.dumps(text_extra, ensure_ascii=False,
                                           separators=(',', ':')))
+        if sticker is not None:
+            # 前端把选中的表情拼成 sticker_* 一组表单字段，与 text 并列发送；
+            # 放在 a_bogus 之前，保证这些字段参与签名。
+            data.update(DouyinAPI._comment_sticker_fields(sticker))
         params.with_a_bogus(data)
         # uid 在 a_bogus 之后追加，不参与签名
         uid = DouyinAPI._comment_uid(auth)
