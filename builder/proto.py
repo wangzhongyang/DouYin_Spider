@@ -96,7 +96,8 @@ class ProtoBuilder:
                                    message=None, identity_security_token="",
                                    identity_security_device_id="", *,
                                    message_type=7, content=None, ext=None,
-                                   mentioned_users=None, client_message_id=None):
+                                   mentioned_users=None, client_message_id=None,
+                                   conversation_type=1, ref_msg_info=None):
         """Build a PC-IM ``message/send`` envelope.
 
         ``message`` is kept as the first positional argument for backwards
@@ -104,6 +105,9 @@ class ProtoBuilder:
         their JSON object through ``content`` and select the wire
         ``message_type`` explicitly.  The protobuf field itself is always a
         compact JSON string, matching the browser SDK.
+
+        ``conversation_type`` 1 单聊 / 2 群聊：群会话必须显式传 2，并配合该会话
+        自己的 ticket（见 ``DouyinAPI.get_conversation_ticket``）。
         """
         if content is None:
             content = message
@@ -118,7 +122,7 @@ class ProtoBuilder:
         else:
             encoded_content = str(content)
         request.body.send_message_body.conversation_id = conversation_id
-        request.body.send_message_body.conversation_type = 1
+        request.body.send_message_body.conversation_type = int(conversation_type)
         request.body.send_message_body.conversation_short_id = conversation_short_id
         request.body.send_message_body.content = encoded_content
         # The web client sends these extensions on every message.  Preserve
@@ -151,6 +155,26 @@ class ProtoBuilder:
         request.body.send_message_body.message_type = int(message_type)
         request.body.send_message_body.ticket = ticket
         request.body.send_message_body.client_message_id = client_message_id
+        if ref_msg_info:
+            # 引用回复：SendMessageRequestBody.ref_msg_info（字段 11）。
+            # static/Request.proto 里该消息的字段名是旧的（original_message_*），
+            # 实际线上是 referenced_message_id(1) / hint(2) / root_*(3,4)。
+            # 这里直接拼 wire 字节再 merge 进去，避免依赖生成代码里的错误命名。
+            ref_payload = ProtoBuilder.proto_field_varint(
+                1, int(ref_msg_info.get('referenced_message_id') or 0)
+            )
+            hint = ref_msg_info.get('hint')
+            if hint:
+                ref_payload += ProtoBuilder.proto_field_bytes(2, str(hint).encode('utf-8'))
+            if ref_msg_info.get('root_message_id'):
+                ref_payload += ProtoBuilder.proto_field_varint(
+                    3, int(ref_msg_info['root_message_id'])
+                )
+            merged = (
+                request.body.send_message_body.SerializeToString()
+                + ProtoBuilder.proto_field_bytes(11, ref_payload)
+            )
+            request.body.send_message_body.ParseFromString(merged)
         # The current send envelope has no top-level ``reuqest_sign``.  The
         # request is authenticated by bd-ticket-guard HTTP headers; the
         # nested conversation ticket remains part of the protobuf body.
@@ -168,3 +192,110 @@ class ProtoBuilder:
             request.headers['identity_security_device_id'] = str(identity_security_device_id)
         request.headers['identity_security_aid'] = ''
         return request
+
+    # ---------- PC IM 会话列表 / ticket 的裸 protobuf 载荷 ----------
+    # ``static/Request.proto`` 只声明了发送与建会话两类 body；会话列表
+    # (get_conversation_list_body=2006) 和会话 ticket (get_ticket_body=2005)
+    # 没有生成代码。这里按 wire 格式手工编码，再用 ParseFromString 塞进
+    # RequestBody 的 unknown field（protobuf 运行时会原样保留并序列化）。
+
+    @staticmethod
+    def proto_varint(value: int) -> bytes:
+        value = int(value)
+        if value < 0:  # int64 负数按 10 字节补码编码
+            value += 1 << 64
+        out = bytearray()
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            out.append(byte | (0x80 if value else 0))
+            if not value:
+                return bytes(out)
+
+    @classmethod
+    def proto_field_varint(cls, number: int, value: int) -> bytes:
+        return cls.proto_varint(number << 3) + cls.proto_varint(value)
+
+    @classmethod
+    def proto_field_bytes(cls, number: int, payload: bytes) -> bytes:
+        payload = payload or b""
+        return (
+            cls.proto_varint((number << 3) | 2)
+            + cls.proto_varint(len(payload))
+            + payload
+        )
+
+    @classmethod
+    def build_get_conversation_list_body(cls, *, cursor=0, limit=20,
+                                         con_type=1, sort_type=1) -> bytes:
+        """GetUserConversationListRequestBody（RequestBody 字段 2006）。
+
+        con_type：1 单聊，2 群聊（实测同一账号两组互不包含）。
+        """
+        inner = (
+            cls.proto_field_varint(1, sort_type)
+            + cls.proto_field_varint(2, cursor)
+            + cls.proto_field_varint(3, con_type)
+            + cls.proto_field_varint(4, limit)
+        )
+        return cls.proto_field_bytes(2006, inner)
+
+    @classmethod
+    def build_get_ticket_body(cls, *, conversation_short_id, conversation_type=1,
+                              to_id=0, ticket_type=1) -> bytes:
+        """GetTicketRequestBody（RequestBody 字段 2005）。"""
+        inner = (
+            cls.proto_field_varint(1, ticket_type)
+            + cls.proto_field_varint(2, conversation_type)
+            + cls.proto_field_varint(4, to_id)
+            + cls.proto_field_varint(5, conversation_short_id)
+        )
+        return cls.proto_field_bytes(2005, inner)
+
+    @classmethod
+    def build_get_conversation_participants_body(cls, *, conversation_id,
+                                                 conversation_short_id,
+                                                 conversation_type=1,
+                                                 cursor=0, limit=100) -> bytes:
+        """ConversationParticipantsListRequestBody（RequestBody 字段 605）。"""
+        inner = (
+            cls.proto_field_bytes(1, str(conversation_id).encode())
+            + cls.proto_field_varint(2, conversation_short_id)
+            + cls.proto_field_varint(3, conversation_type)
+            + cls.proto_field_varint(4, cursor)
+            + cls.proto_field_varint(5, limit)
+        )
+        return cls.proto_field_bytes(605, inner)
+
+    @staticmethod
+    def parse_proto_fields(payload: bytes) -> dict:
+        """按 wire 格式解析成 ``{字段号: [值, ...]}``；wire2 的值保持 bytes。"""
+
+        def read_varint(buf, pos):
+            shift = value = 0
+            while True:
+                byte = buf[pos]
+                pos += 1
+                value |= (byte & 0x7F) << shift
+                if not byte & 0x80:
+                    return value, pos
+                shift += 7
+
+        fields: dict[int, list] = {}
+        pos = 0
+        while pos < len(payload):
+            key, pos = read_varint(payload, pos)
+            number, wire = key >> 3, key & 7
+            if wire == 0:
+                value, pos = read_varint(payload, pos)
+            elif wire == 1:
+                value, pos = payload[pos:pos + 8], pos + 8
+            elif wire == 2:
+                length, pos = read_varint(payload, pos)
+                value, pos = payload[pos:pos + length], pos + length
+            elif wire == 5:
+                value, pos = payload[pos:pos + 4], pos + 4
+            else:
+                raise ValueError(f"不支持的 protobuf wire type: {wire}")
+            fields.setdefault(number, []).append(value)
+        return fields

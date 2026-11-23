@@ -20,8 +20,11 @@ class DouyinRecvMsg:
     RECONNECT_BACKOFF_START = 1.0
     RECONNECT_BACKOFF_MAX = 30.0
 
-    def __init__(self, auth: DouyinAuth, auto_reconnect=True):
+    def __init__(self, auth: DouyinAuth, auto_reconnect=True, on_event=None):
         self.auto_reconnect = auto_reconnect
+        # 可选的结构化回调：MCP 服务用它把私信投进内存缓冲；CLI 不传，行为不变
+        self.on_event = on_event
+        self.received = 0
         self.auth = auth
         self.ws = None
         self._should_reconnect = False   # on_error 打标记，真正重连在 start() 的循环里
@@ -45,30 +48,69 @@ class DouyinRecvMsg:
         self._opened = True
         print("WebSocket connection open.")
 
+    def _emit(self, event: dict):
+        """把一条消息交给消费方；消费方抛异常不能带走连接。"""
+        self.received += 1
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(event)
+        except Exception as exc:  # pragma: no cover - 消费方的问题不该断线
+            print(f"\033[31m### on_event 回调异常: {type(exc).__name__}: {exc} ###\033[m")
+
     def on_message(self, ws, message):
         frame = Live_pb2.PushFrame()
         frame.ParseFromString(message)
         if frame.payloadType == 'pb':
             response = Response_pb2.Response()
             response.ParseFromString(frame.payload)
-            sender = response.body.new_message_notify.message.sender
-            content = response.body.new_message_notify.message.content
-            msg_type = response.body.new_message_notify.message.message_type
-            conversation_id = response.body.new_message_notify.message.conversation_id
-            index = response.body.new_message_notify.message.index_in_conversation
-            content = json.loads(content)
+            notify = response.body.new_message_notify
+            message_obj = notify.message
+            sender = message_obj.sender
+            content = json.loads(message_obj.content)
+            msg_type = message_obj.message_type
+            conversation_id = message_obj.conversation_id
+            index = message_obj.index_in_conversation
+
+            conversation_type = int(message_obj.conversation_type or 0)
+            event = {
+                'type': msg_type,
+                'uid': int(sender or 0),
+                # 1 单聊 / 2 群聊（抖音 PC IM 的取值），未知值原样保留
+                'conversation_type': conversation_type,
+                'chat_type': {1: 'single', 2: 'group'}.get(conversation_type, f'type_{conversation_type}'),
+                'conversation_id': conversation_id,
+                'conversation_short_id': int(message_obj.conversation_short_id or 0),
+                'index': int(index or 0),
+                'server_message_id': str(message_obj.server_message_id or ''),
+                'ts': int(time.time() * 1000),
+            }
             if msg_type == 7:
+                event['text'] = content.get('text', '')
                 print(f'【消息编号:{index}】【聊天室ID:{conversation_id}】【来自:{sender}】文本消息:{content["text"]}')
             elif msg_type == 5:
-                print(f'【消息编号:{index}】【聊天室ID:{conversation_id}】【来自:{sender}】用户表情包消息:{content["url"]["url_list"][0]}')
+                url_info = content.get('url') or {}
+                event['url'] = (url_info.get('url_list') or [''])[0]
+                event['image_id'] = str(content.get('image_id') or '')
+                event['uri'] = str(url_info.get('uri') or '')
+                event['package_id'] = content.get('package_id') or 0
+                event['display_name'] = content.get('display_name') or ''
+                # 原始 content 原样透出：转发时需要 width/height/image_type/aweType 等
+                event['raw_content'] = content
+                print(f'【消息编号:{index}】【聊天室ID:{conversation_id}】【来自:{sender}】用户表情包消息:{event["url"]}')
             elif msg_type == 17:
+                event['url'] = content['resource_url']['url_list'][0]
                 print(f'【消息编号:{index}】【聊天室ID:{conversation_id}】【来自:{sender}】语音信息:{content["resource_url"]["url_list"][0]}')
             elif msg_type == 27:
+                event['url'] = content['resource_url']['origin_url_list'][0]
                 print(f'【消息编号:{index}】【聊天室ID:{conversation_id}】【来自:{sender}】图片信息:{content["resource_url"]["origin_url_list"][0]}')
             elif msg_type == 8:
+                event['item_id'] = str(content.get('itemId', ''))
                 print(f'【消息编号:{index}】【聊天室ID:{conversation_id}】【来自:{sender}】分享视频信息:视频ID{content["itemId"]}')
             elif msg_type == 50001:
+                event['read_index'] = int(content.get('read_index') or 0)
                 print(f'对方已读，消息标号:{content["read_index"]}')
+            self._emit(event)
         elif frame.payloadType == 'text/json':
             print(json.loads(frame.payload))
 

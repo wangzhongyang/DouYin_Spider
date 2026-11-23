@@ -1,0 +1,3 @@
+# MCP 远程服务依赖（爬虫本体不需要这些；Python >= 3.10）
+# 固定 v1：v2 把 FastMCP 改名 MCPServer 并换用 httpx2，OAuth 装配方式也变了
+mcp>=1.30,<2

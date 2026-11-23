@@ -18,6 +18,14 @@ from google.protobuf.json_format import MessageToDict as _message_to_dict
 def protobuf_to_dict(message):
     return _message_to_dict(message, preserving_proto_field_name=True)
 
+
+def _pb_text(values, default=""):
+    """取 wire 解析结果里的第一个字符串字段（bytes -> str）。"""
+    if not values:
+        return default
+    value = values[0]
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+
 import static.Response_pb2 as ResponseProto
 from builder.auth import DouyinAuth
 from builder.header import HeaderBuilder, HeaderType
@@ -561,13 +569,15 @@ class DouyinAPI:
         :param auth: DouyinAuth object.
         :param query: 搜索关键字.
         :param num: 搜索结果数量.
+        :param douyin_user_fans: 粉丝数量区间，透传给 search_user.
+        :param douyin_user_type: 用户类型，透传给 search_user.
         :return: 用户列表.
         """
         offset = "0"
         count = "25"
         user_list = []
         while True:
-            res_json = DouyinAPI.search_user(auth, query, offset, count)
+            res_json = DouyinAPI.search_user(auth, query, offset, count, **kwargs)
             users = res_json["user_list"]
             user_list.extend(users)
             if res_json["has_more"] != 1 or len(user_list) >= num:
@@ -2260,27 +2270,56 @@ class DouyinAPI:
             return ""
 
     @staticmethod
-    def create_conversation(auth, to_user_id: int, **kwargs):
-        """
-        创建私信对话.
-        :param auth: DouyinAuth object.
-        :param to_user_id: 私信对话接收者ID.
-        :return: 私信对话ID.
-        """
-        url = "https://imapi.douyin.com/v2/conversation/create"
-        requestProto = ProtoBuilder.build_create_conversation_request(auth, to_user_id, auth.get_uid())
+    def _im_post(auth, path: str, request) -> bytes:
+        """统一的 imapi protobuf POST：Cookie + bd-ticket-guard 头，无 query 签名。"""
         headers = HeaderBuilder().build(HeaderType.PROTOBUF)
         headers.set_header('referer', 'https://www.douyin.com/')
-
         resp = requests.post(
-            url,
+            f'https://imapi.douyin.com{path}',
             headers=headers.get(),
             cookies=auth.cookie,
-            data=requestProto.SerializeToString(),
-            verify=False
+            data=request.SerializeToString(),
+            verify=False,
         )
+        return resp.content
+
+    @staticmethod
+    def resolve_user_uid(auth, target) -> int:
+        """把用户主页链接 / 纯数字 uid 统一解析成 uid。"""
+        value = str(target).strip()
+        if not value:
+            raise ValueError("target 不能为空")
+        if value.isdigit():
+            return int(value)
+        info = DouyinAPI.get_user_info(auth, value)
+        user = (info or {}).get("user") or {}
+        uid = user.get("uid")
+        if not uid:
+            raise RuntimeError(f"无法从 {target!r} 解析出用户 uid")
+        return int(uid)
+
+    @staticmethod
+    def open_conversation_with_user(auth, target):
+        """按「用户链接 / uid」打开（或创建）单聊会话。
+
+        :return: (uid, conversation_id, conversation_short_id, ticket)
+        """
+        uid = DouyinAPI.resolve_user_uid(auth, target)
+        conversation_id, short_id, ticket = DouyinAPI.create_conversation(auth, uid)
+        return uid, conversation_id, short_id, ticket
+
+    @staticmethod
+    def create_conversation(auth, to_user_id: int, **kwargs):
+        """
+        创建单聊私信对话.
+        :param auth: DouyinAuth object.
+        :param to_user_id: 私信对话接收者ID.
+        :return: (conversation_id, conversation_short_id, ticket)
+        """
+        requestProto = ProtoBuilder.build_create_conversation_request(auth, to_user_id, auth.get_uid())
+        content = DouyinAPI._im_post(auth, '/v2/conversation/create', requestProto)
         responseProto = ResponseProto.Response()
-        responseProto.ParseFromString(resp.content)
+        responseProto.ParseFromString(content)
         resp_json = protobuf_to_dict(responseProto)
         conversation = resp_json['body']['create_conversation_v2_body']['conversation_info_list'][0]
         conversation_id = conversation['conversation_id']
@@ -2300,21 +2339,13 @@ class DouyinAPI:
                  解析失败返回 None。
         """
         import blackboxprotobuf
-        url = "https://imapi.douyin.com/v2/conversation/get_info_list"
-        requestProto = ProtoBuilder.build_get_conversation_list_info_request(auth, to_user_id, auth.get_uid(), conversation_short_id)
-        headers = HeaderBuilder().build(HeaderType.PROTOBUF)
-        headers.set_header('referer', 'https://www.douyin.com/')
-
-        resp = requests.post(
-            url,
-            headers=headers.get(),
-            cookies=auth.cookie,
-            data=requestProto.SerializeToString(),
-            verify=False
+        requestProto = ProtoBuilder.build_get_conversation_list_info_request(
+            auth, to_user_id, auth.get_uid(), conversation_short_id
         )
+        content = DouyinAPI._im_post(auth, '/v2/conversation/get_info_list', requestProto)
         try:
             # 字段名是 blackboxprotobuf 自动推断出来的编号，没有 proto 定义可依
-            data, _message_type = blackboxprotobuf.decode_message(resp.content)
+            data, _message_type = blackboxprotobuf.decode_message(content)
             conv = data['6']['610']['1']
             core = conv['50']
 
@@ -2329,6 +2360,218 @@ class DouyinAPI:
             }
         except Exception:
             return None
+
+    @staticmethod
+    def get_user_conversation_list(auth, con_type: int = 1, cursor: int = 0,
+                                   limit: int = 20, sort_type: int = 1, **kwargs) -> dict:
+        """取会话列表（PC IM `v1/conversation/list`）。
+
+        :param con_type: 1 单聊，2 群聊。实测两类互不包含，要拿全需要各查一次。
+        :param cursor: 分页游标，首页 0。
+        :param limit: 每页数量。
+        :param sort_type: 1 按活跃时间（默认），其余取值见 PC 端枚举。
+        :return: {"conversations": [{conversation_id, conversation_short_id,
+                 conversation_type, ticket, name, icon, participants_count}],
+                 "has_more", "next_cursor", "message"}
+        """
+        request = ProtoBuilder.build_normal_request(auth, 2006)
+        request.body.ParseFromString(ProtoBuilder.build_get_conversation_list_body(
+            cursor=cursor, limit=limit, con_type=con_type, sort_type=sort_type,
+        ))
+        content = DouyinAPI._im_post(auth, '/v1/conversation/list', request)
+        wrapper = ProtoBuilder.parse_proto_fields(content)
+        body = ProtoBuilder.parse_proto_fields(wrapper.get(6, [b''])[0])
+        listing = ProtoBuilder.parse_proto_fields(body.get(2006, [b''])[0])
+        conversations = []
+        for raw in listing.get(1, []):
+            item = ProtoBuilder.parse_proto_fields(raw)
+            core = ProtoBuilder.parse_proto_fields(item[50][0]) if item.get(50) else {}
+            conversations.append({
+                "conversation_id": _pb_text(item.get(1)),
+                "conversation_short_id": int((item.get(2) or [0])[0]),
+                "conversation_type": int((item.get(3) or [0])[0]),
+                "ticket": _pb_text(item.get(4)),
+                "name": _pb_text(core.get(5)),
+                "icon": _pb_text(core.get(7)),
+                "participants_count": int((item.get(7) or [0])[0]),
+            })
+        return {
+            "conversations": conversations,
+            "has_more": bool((listing.get(2) or [0])[0]),
+            "next_cursor": int((listing.get(3) or [0])[0]),
+            "message": _pb_text(wrapper.get(4)),
+        }
+
+    @staticmethod
+    def resolve_conversation_ticket(auth, conversation_short_id: int, conversation_type: int = 1,
+                                    conversation_id: str = "", ticket: str = "") -> str:
+        """拿会话 ticket：优先调用方给的，其次会话列表，最后 get_info_list。"""
+        if ticket:
+            return ticket
+        try:
+            listing = DouyinAPI.get_user_conversation_list(
+                # 服务端对 limit=100 会返回空列表，50 实测正常
+                auth, con_type=conversation_type, limit=50,
+            )
+        except Exception:
+            listing = {}
+        for item in (listing or {}).get("conversations", []):
+            if int(item.get("conversation_short_id") or 0) != int(conversation_short_id):
+                continue
+            if conversation_id and str(item.get("conversation_id")) != str(conversation_id):
+                continue
+            if item.get("ticket"):
+                return item["ticket"]
+        if conversation_id:
+            _short_id, ticket = DouyinAPI.get_conversation_ticket(
+                auth, conversation_id, conversation_type=conversation_type,
+            )
+            return ticket or ""
+        return ""
+
+    @staticmethod
+    def get_conversation_participants(auth, conversation_id: str, conversation_short_id: int,
+                                      conversation_type: int = 1, cursor: int = 0,
+                                      limit: int = 100, **kwargs) -> dict:
+        """取会话成员列表（PC IM `v1/conversation/participants_list`，cmd 605）。
+
+        群成员才有意义；返回 uid / sec_uid / alias（群昵称）/ role / avatar。
+        """
+        request = ProtoBuilder.build_normal_request(auth, 605)
+        request.body.ParseFromString(ProtoBuilder.build_get_conversation_participants_body(
+            conversation_id=conversation_id,
+            conversation_short_id=conversation_short_id,
+            conversation_type=conversation_type,
+            cursor=cursor,
+            limit=limit,
+        ))
+        content = DouyinAPI._im_post(auth, '/v1/conversation/participants_list', request)
+        wrapper = ProtoBuilder.parse_proto_fields(content)
+        body = ProtoBuilder.parse_proto_fields(wrapper.get(6, [b''])[0])
+        response = ProtoBuilder.parse_proto_fields(body.get(605, [b''])[0])
+        page = ProtoBuilder.parse_proto_fields(response.get(1, [b''])[0])
+        participants = []
+        for raw in page.get(1, []):
+            item = ProtoBuilder.parse_proto_fields(raw)
+            participants.append({
+                "uid": str((item.get(1) or [0])[0]),
+                "sec_uid": _pb_text(item.get(5)),
+                "alias": _pb_text(item.get(4)),
+                "role": int((item.get(3) or [0])[0]),
+                "avatar": _pb_text(item.get(40)),
+            })
+        return {
+            "participants": participants,
+            "has_more": bool((page.get(2) or [0])[0]),
+            "cursor": int((page.get(3) or [0])[0]),
+        }
+
+    @staticmethod
+    def get_emoji_list(auth, need_all: bool = True, **kwargs) -> list:
+        """取 PC 端小表情列表（`/aweme/v1/web/emoji/list`）。
+
+        :return: [{"name": "[微笑]", "url": "...", "hide": 0}]；name 就是消息文本里
+                 用来渲染表情的 token。
+        """
+        refer = 'https://www.douyin.com/chat'
+        headers = HeaderBuilder().build(HeaderType.GET)
+        headers.set_referer(refer)
+        headers.set_header('accept', 'application/json, text/plain, */*')
+        headers.with_uifid(auth)
+        params = Params()
+        params.add_param('device_platform', 'webapp')
+        params.add_param('aid', '6383')
+        params.add_param('channel', 'channel_pc_web')
+        params.add_param('need_all', 'true' if need_all else 'false')
+        params.add_param('update_version_code', '170400')
+        params.add_param('pc_client_type', '1')
+        params.add_param('version_code', '170400')
+        params.add_param('version_name', '17.4.0')
+        params.with_platform(round_trip_time='0')
+        params.with_web_id(auth, refer)
+        params.with_uifid(auth)
+        params.with_verify_fp(auth)
+        params.add_param('msToken', auth.msToken)
+        params.with_a_bogus()
+        resp = requests.get(
+            f'{DouyinAPI.douyin_url}/aweme/v1/web/emoji/list',
+            headers=headers.get(), cookies=auth.cookie, params=params.get(), verify=False,
+        )
+        check_risk_response(resp)
+        data = resp.json()
+        emojis = []
+        for item in data.get('emoji_list') or []:
+            urls = ((item.get('emoji_url') or {}).get('url_list') or [])
+            emojis.append({
+                "name": item.get('display_name') or '',
+                "url": urls[0] if urls else '',
+                "hide": int(item.get('hide') or 0),
+            })
+        return emojis
+
+    @staticmethod
+    def get_collected_stickers(auth, cursor: str = '0', page_size: str = '50',
+                               **kwargs) -> dict:
+        """收藏的表情列表（复用 custom sticker 聚合接口的收藏页）。"""
+        return DouyinAPI.get_custom_stickers(
+            auth, cursor, page_size, source='CUSTOM_STICKER_PAGE',
+        )
+
+    @staticmethod
+    def collect_sticker(auth, sticker_ids, action: int = 1, sticker_type: int = 0,
+                        sticker_uri: str = "", sticker_url: str = "",
+                        resource_id: str = "0", **kwargs) -> dict:
+        """收藏 / 取消收藏表情（`/aweme/v1/web/im/resource/sticker/collect/`）。
+
+        实测要点（2026-11-24 用真实收藏请求对拍）：
+        - 公共参数组必须用 aid=1128 / app_id=1128，而 ``with_platform()`` 会把 aid
+          写成 6383，所以先铺公共组再覆盖 aid/device_platform/channel；
+        - 请求体是 JSON 空对象 ``{}``，并带 ``x-secsdk-csrf-token: DOWNGRADE``；
+        - ``sticker_ids`` 是 ``[123]`` 形式的字符串（数字不带引号）；
+        - 消息里的表情包：``sticker_type=1``、``sticker_uri``/``sticker_url`` 取
+          消息 content.url，``resource_id`` 取 content.package_id（用户自制表情包
+          可能是 ``-作者uid``）；GIF 面板项：``sticker_type=0``，uri/url 留空、
+          resource_id="0"，sticker_ids 用 ``single_hey_can_id``。
+
+        :param action: 1 收藏，0 取消收藏。
+        :return: 原始 JSON（status_code / success_items 等）。
+        """
+        if isinstance(sticker_ids, (str, int)):
+            sticker_ids = [sticker_ids]
+        ids = '[' + ','.join(str(item) for item in sticker_ids) + ']'
+        refer = 'https://www.douyin.com/chat'
+        headers = HeaderBuilder().build(HeaderType.POST)
+        headers.set_header('accept', 'application/json, text/plain, */*')
+        headers.set_header('content-type', 'application/json;charset=UTF-8')
+        headers.set_header('origin', 'https://www.douyin.com')
+        headers.set_referer(refer)
+        headers.set_header('x-secsdk-csrf-token', 'DOWNGRADE')
+        headers.with_uifid(auth)
+        params = Params()
+        # 先铺公共组（会写 aid=6383），再用收藏接口自己的 1128 覆盖
+        params.with_platform(round_trip_time='200')
+        params.add_param('device_platform', 'webapp')
+        params.add_param('aid', '1128')
+        params.add_param('channel', 'channel_pc_web')
+        params.add_param('app_id', '1128')
+        params.add_param('action', str(int(action)))
+        params.add_param('sticker_ids', ids)
+        params.add_param('sticker_uri', sticker_uri or '')
+        params.add_param('sticker_url', sticker_url or '')
+        params.add_param('resource_id', str(resource_id or '0'))
+        params.add_param('sticker_type', str(int(sticker_type)))
+        params.with_web_id(auth, refer)
+        params.with_uifid(auth)
+        params.with_verify_fp(auth)
+        params.add_param('msToken', auth.msToken)
+        params.with_a_bogus()
+        resp = requests.post(
+            f'{DouyinAPI.douyin_url}/aweme/v1/web/im/resource/sticker/collect/',
+            headers=headers.get(), cookies=auth.cookie, params=params.get(),
+            data='{}', verify=False,
+        )
+        check_risk_response(resp)
+        return resp.json()
 
     @staticmethod
     def get_identity_security_token(auth, force=False, **kwargs):
@@ -2420,6 +2663,7 @@ class DouyinAPI:
     def _send_message_raw(auth, conversation_id, conversation_short_id, ticket,
                           message_type, content, *, ext=None,
                           mentioned_users=None, client_message_id=None,
+                          conversation_type=1, ref_msg_info=None,
                           **kwargs) -> bool:
         """Send one already-built PC IM message payload.
 
@@ -2427,6 +2671,8 @@ class DouyinAPI:
         type/content returned by :class:`DouyinIMMedia`. Keeping one raw send
         path ensures all message types receive the same current ticket-guard,
         identity-security and a_bogus parameters.
+
+        ``conversation_type`` 1 单聊 / 2 群聊；群聊必须传 2 且 ticket 属于该群。
         """
         url = 'https://imapi.douyin.com/v1/message/send'
         headers = HeaderBuilder().build(HeaderType.PROTOBUF)
@@ -2439,6 +2685,8 @@ class DouyinAPI:
             mentioned_users=mentioned_users, client_message_id=client_message_id,
             identity_security_token=identity_token,
             identity_security_device_id=identity_device_id,
+            conversation_type=conversation_type,
+            ref_msg_info=ref_msg_info,
         )
         # Browser order is msToken -> a_bogus -> verifyFp -> fp.  Only the
         # first field participates in the a_bogus input for this endpoint.
@@ -2461,6 +2709,91 @@ class DouyinAPI:
         return success
 
     @staticmethod
+    def build_text_content(text: str = "", *, conversation_id: str = "",
+                           mentions=None, emojis=None, reply=None,
+                           auth=None, my_uid=None):
+        """拼 PC IM 文本消息 content，以及配套的 mentioned_users / ref_msg_info。
+
+        - ``mentions``：[{"uid": "...", "name": "昵称"}]，文本前会自动加 ``@昵称 ``，
+          并生成 richTextInfos（infoType 1=@人，2=加粗），uid 进 mentioned_users。
+        - ``emojis``：表情 token 列表（如 ``["[微笑]"]``），文本直接带 token 即可渲染。
+        - ``reply``：{"server_message_id", "uid", "nickname", "hint", "content",
+          "type", "sec_uid", "self"}；给了就把 aweType 改成 703（TEXT_REF_MSG）
+          并返回 ref_msg_info。hint 缺省时用 content 文本。
+          ``self``（回复自己还是别人）不传时：给了 ``auth`` 或 ``my_uid`` 会自动判断。
+
+        :return: (content: dict, mentioned_users: list[int], ref_msg_info: dict | None)
+        """
+        infos = []
+        mentioned = []
+        prefix = ""
+        for mention in mentions or []:
+            uid = str((mention or {}).get("uid") or "").strip()
+            name = str((mention or {}).get("name") or "").strip()
+            if not uid or not name:
+                raise ValueError('mentions 每项都需要 uid 和 name，如 {"uid": "123", "name": "昵称"}')
+            segment = f"@{name} "
+            location = len(prefix)
+            infos.append({
+                "info": {"uid": uid, "con_id": str(conversation_id)},
+                "infoType": 1,  # TYPE_JUMP_USER_PROFILE
+                "length": len(segment),
+                "location": location,
+            })
+            infos.append({
+                "info": {"font_weight": 2},
+                "infoType": 2,
+                "length": len(segment),
+                "location": location,
+            })
+            prefix += segment
+            mentioned.append(int(uid))
+        prefix += "".join(str(token) for token in (emojis or []))
+        text = f"{prefix}{text or ''}"
+
+        content = {
+            "aweType": 703 if reply else 700,  # 703 = TEXT_REF_MSG，700 = AWEME_TEXT
+            "type": 0,
+            "richTextInfos": infos,
+            "text": text,
+        }
+        ref_msg_info = None
+        if reply:
+            server_id = int(reply.get("server_message_id") or 0)
+            if server_id <= 0:
+                raise ValueError("reply 需要 server_message_id（消息的 server_message_id）")
+            hint = reply.get("hint")
+            if hint is None:
+                hint = reply.get("content") or reply.get("text") or ""
+            is_self = reply.get("self")
+            if is_self is None and reply.get("uid"):
+                self_uid = my_uid
+                if self_uid is None and auth is not None:
+                    try:
+                        self_uid = int(auth.get_uid())
+                    except Exception:
+                        self_uid = None
+                if self_uid is not None:
+                    is_self = int(reply["uid"]) == int(self_uid)
+            hint_payload = {
+                "refmsg_type": int(reply.get("type") or 7),
+                "content": str(hint),
+                "refmsg_uid": int(reply.get("uid") or 0),
+                "refmsg_sec_uid": str(reply.get("sec_uid") or ""),
+                "nickname": str(reply.get("nickname") or ""),
+                "refmsg_content": str(reply.get("content") or ""),
+                "version": 1,
+                "itemId": str(reply.get("item_id") or ""),
+                # 1 回复别人 / 2 回复自己
+                "scene_type": 2 if is_self else 1,
+            }
+            ref_msg_info = {
+                "referenced_message_id": server_id,
+                "hint": json.dumps(hint_payload, ensure_ascii=False, separators=(",", ":")),
+            }
+        return content, mentioned, ref_msg_info
+
+    @staticmethod
     def send_msg(auth, conversation_id, conversation_short_id, ticket,
                  content: str, **kwargs) -> bool:
         """发送文本私信（兼容旧调用）。"""
@@ -2479,6 +2812,66 @@ class DouyinAPI:
         )
 
     send_text = send_msg
+
+    @staticmethod
+    def get_conversation_ticket(auth, conversation_id, conversation_type=2, **kwargs):
+        """Fetch (conversation_short_id, ticket) for an existing conversation.
+
+        Muse addition 2026-11-22: conversation/get_info_list returns the
+        conversation ticket in field 4 of the conversation info (same field
+        layout for 1:1 and group). For groups the short_id equals the
+        numeric conversation_id. Returns (None, None) on failure.
+        """
+        import blackboxprotobuf
+        requestProto = ProtoBuilder.build_get_conversation_list_info_request(
+            auth, 0, auth.get_uid(), 0)
+        data = requestProto.body.get_conversation_info_list_v2_body.data
+        data.conversation_id = str(conversation_id)
+        data.conversation_type = conversation_type
+        data.conversation_short_id = 0
+        headers = HeaderBuilder().build(HeaderType.PROTOBUF)
+        headers.set_header('referer', 'https://www.douyin.com/')
+        resp = requests.post(
+            'https://imapi.douyin.com/v2/conversation/get_info_list',
+            headers=headers.get(), cookies=auth.cookie,
+            data=requestProto.SerializeToString(), verify=False)
+        try:
+            tree, _mt = blackboxprotobuf.decode_message(resp.content)
+            conv = tree['6']['610']['1']
+            short_id = int(conv['2'])
+            ticket = conv['4']
+            if isinstance(ticket, bytes):
+                ticket = ticket.decode('utf-8')
+            return short_id, ticket
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def send_group_msg(auth, group_conversation_id, content: str, **kwargs) -> bool:
+        """发送群聊文本消息（Muse addition 2026-11-22，实测送达）。
+
+        Group sends need conversation_type=2 plus the group conversation's
+        own ticket, fetched via get_conversation_ticket. The envelope patch
+        in ProtoBuilder.build_send_message_request applies as for 1:1.
+        """
+        short_id, ticket = DouyinAPI.get_conversation_ticket(
+            auth, group_conversation_id, conversation_type=2)
+        if not ticket:
+            return False
+        if isinstance(content, dict):
+            payload = content
+        else:
+            payload = {
+                "aweType": 700,
+                "type": 0,
+                "richTextInfos": [],
+                "text": str(content),
+            }
+        return DouyinAPI._send_message_raw(
+            auth, str(group_conversation_id), short_id, ticket,
+            DouyinAPI.IM_TEXT, payload, conversation_type=2, **kwargs,
+        )
+
 
     @staticmethod
     def send_image(auth, conversation_id, conversation_short_id, ticket,
@@ -2566,6 +2959,10 @@ class DouyinAPI:
                 package_id=kwargs.pop("package_id", 0),
                 url_list=kwargs.pop("url_list", None),
             )
+            # 501 = GIF 面板表情，510 = 消息里的表情贴纸（默认）
+            awe_type = kwargs.pop("awe_type", None)
+            if awe_type:
+                sticker["aweType"] = int(awe_type)
         return DouyinAPI._send_message_raw(
             auth, conversation_id, conversation_short_id, ticket, DouyinAPI.IM_BIG_EMOJI, sticker,
             **kwargs,

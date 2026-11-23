@@ -180,7 +180,163 @@ python dy_apis/douyin_recv_msg.py
 
 # 创作者中心快速发布图集 / 视频（先修改文件顶部的“用户配置”）
 python quick_publish.py
+
+# 远程 MCP 服务（OAuth 2.0 登录，对外暴露所有能力）
+python -m mcp_server
 ```
+
+### 🧩 MCP 服务（远程 / OAuth 2.0 / Cloudflare 隧道）
+
+把上面这些能力原样包装成 MCP 工具，给 Claude Desktop / Cursor / ChatGPT 之类的客户端用。
+**不改动任何已有入口**——这是纯新增的一层 HTTP + 鉴权 + 工具声明，抖音协议、签名、登录态、
+发布链路全部复用 `dy_apis` / `utils` 里的现有实现。
+
+#### 安装与启动
+
+```bash
+# MCP 依赖独立成一档，爬虫本体不需要装
+pip install -r requirements-mcp.txt      # mcp>=1.30,<2
+conda activate DouYin_Spider             # 项目事实上的运行环境（Python 3.10）
+
+python -m mcp_server --check             # 先看配置与工具清单（不起服务）
+python -m mcp_server                     # 起服务，默认 127.0.0.1:8765
+```
+
+#### `.env` 里新增的配置
+
+```dotenv
+MCP_HOST=127.0.0.1
+MCP_PORT=8765
+MCP_PUBLIC_URL=https://douyin.vbvcv.xyz   # 必须与隧道 ingress 的 hostname 一致
+MCP_USERNAME=douyin                       # 登录页账号
+MCP_PASSWORD=change-me                    # 登录页密码，务必改成自己的
+MCP_ENABLE_WRITE=on                       # off = 只注册只读工具
+MCP_WRITE_RATE_LIMIT=300                  # 写接口滑动窗口（次）
+MCP_WRITE_RATE_WINDOW=600                 # 窗口秒数
+MCP_LOGIN_MAX_FAILS=5                     # 同 IP 失败几次后锁定
+MCP_LOGIN_LOCK_SECONDS=300
+```
+
+`MCP_SECRET_KEY` 留空会自动生成到 `datas/mcp/secret.key`（0600），用于给
+`/login?req=…` 链接签名；OAuth 状态存在 `datas/mcp/oauth.db`（SQLite，已 gitignore）。
+
+#### 对外端点
+
+| 路径 | 说明 |
+|---|---|
+| `POST /mcp` | MCP 端点（Streamable HTTP），需 `Authorization: Bearer <access_token>` |
+| `GET /authorize` | 授权入口，校验 client / redirect_uri / PKCE 后跳到登录页 |
+| `GET POST /login` | 用户名密码登录页（就是 `MCP_USERNAME` / `MCP_PASSWORD`） |
+| `POST /token` | 授权码换 token / refresh 换 token |
+| `POST /register` | 动态客户端注册（DCR，RFC 7591） |
+| `POST /revoke` | 撤销令牌 |
+| `GET /.well-known/oauth-authorization-server` | AS 元数据（RFC 8414） |
+| `GET /.well-known/oauth-protected-resource/mcp` | 受保护资源元数据（RFC 9728） |
+| `GET /healthz` | 免认证探活：版本 / 工具数 / issuer |
+
+#### 客户端怎么接
+
+浏览器类客户端（Claude Desktop / ChatGPT 连接器）：新建自定义连接器，URL 填
+`https://douyin.vbvcv.xyz/mcp`，点连接后会自动打开登录页，输 `MCP_USERNAME` /
+`MCP_PASSWORD` 即可，令牌自动保存并刷新。
+
+配置文件类客户端（Cursor / Claude Code / Cline 等）：
+
+```json
+{
+  "mcpServers": {
+    "douyin": {
+      "type": "http",
+      "url": "https://douyin.vbvcv.xyz/mcp"
+    }
+  }
+}
+```
+
+不做 DCR 的客户端可以预注册：`.env` 里填 `MCP_CLIENT_ID` / `MCP_CLIENT_SECRET` /
+`MCP_CLIENT_REDIRECT_URIS`（逗号分隔）。
+
+#### 私信接收（WebSocket 推送）
+
+抖音**没有私信历史接口**，能拿到的只有 WebSocket 推送。所以 MCP 侧是一套
+「常驻连接 + 内存环形缓冲 + 按 seq 增量取」的模型：
+
+| 工具 | 作用 |
+|---|---|
+| `im_listen_status` | 看是否在连、连上没有、缓冲多少条、丢了多少 |
+| `im_listen_events(after_seq, limit, wait_seconds)` | 增量取新消息；`wait_seconds` 长轮询最多 25s |
+| `im_listen_start` / `im_listen_stop` | 手动启停（默认开机自动连，`MCP_IM_AUTOSTART=on`） |
+
+每条事件含：`seq`、`type`（7 文本 / 5 表情 / 17 语音 / 27 图片 / 8 分享视频 / 50001 已读回执）、
+`uid`、**`conversation_type`（1 单聊 / 2 群聊）与 `chat_type`（single / group）**、
+`conversation_id`、`conversation_short_id`、`index`、`server_message_id`，
+以及 `text`（文本）或 `url`（媒体地址）、`ts` / `received_at`。
+表情消息（type=5）额外带 `image_id / uri / package_id / display_name`，并把服务端原始
+content 放在 `raw_content`（含 `width / height / image_type / aweType` 等，转发或精确
+收藏时用）。
+
+> 群聊**现在可以收也可以发**：`im_conversations(conversation_type=2)` 拿群会话的
+> `conversation_id / conversation_short_id / ticket`，再用
+> `im_send_text_to_conversation(..., conversation_type=2)` 回复；ticket 留空会自动解析。
+> 还可直接从 `im_listen_events` 的群消息事件里取 `conversation_id / conversation_short_id`。
+> 单聊的 `im_send_*`（按用户寻址）保持原样，内部仍是 `create_conversation(conversation_type=1)`。
+>
+> 群消息还支持这些附加能力（单聊文本工具同样可用）：
+> - **@人**：`im_conversation_members` 查成员 uid，然后
+>   `mentions=[{"uid": "53127236531", "name": "young🧐"}]`；工具会补 `@昵称 `、
+>   `richTextInfos`（infoType 1/2）和 `mentioned_users`。
+> - **表情**：`emoji_list` 返回可用 token（如 `[微笑]`），
+>   `emojis=["[微笑]"]` 直接拼进正文；表情就是文本 token，客户端按 token 渲染。
+> - **表情包**：`sticker_favorites` 列收藏、`sticker_collect` 收藏/取消收藏、
+>   `im_send_sticker_to_conversation` 发到群；GIF 面板表情要传 `awe_type=501`，
+>   消息贴纸用默认 510，否则 PC 端会显示“暂不支持该消息类型展示”。
+> - **引用回复**：`im_listen_events` 事件里的 `server_message_id` 就是引用目标，
+>   `reply={"server_message_id": ..., "uid": ..., "nickname": ..., "hint": ...}`；
+>   content 的 `aweType` 会切成 703（TEXT_REF_MSG），并写入 `ref_msg_info`。
+
+客户端用法：`im_listen_events(after_seq=0)` 拿全量 → 记下 `next_seq` →
+下次 `after_seq=next_seq`，或者直接 `wait_seconds=20` 长轮询等新消息。
+缓冲上限由 `MCP_IM_BUFFER` 控制（默认 5000），溢出时 `dropped` 会增加；
+**服务停机期间的消息补不回来**（推送模型固有限制）。
+
+延迟参考（实测，上海→抖音，经 Cloudflare 隧道）：单次接口往返约 0.6–0.8s；
+私信推送到达 WS 后进缓冲是亚秒级，`im_listen_events` 一次取数约 0.4s。
+
+#### Scope 与写操作
+
+- `douyin.read`：所有查询类工具（用户、作品、评论、搜索、直播榜单、私信会话信息…）
+- `douyin.write`：点赞、评论（含图片表情、@ 提及 `text_extra`）、收藏、发私信、直播间点赞/弹幕、创作者发布、下载/导出
+
+默认 DCR 会把两个 scope 都给客户端。写操作额外受 `MCP_WRITE_RATE_LIMIT`（默认 300 次 / 600 秒）限流；
+`MCP_ENABLE_WRITE=off` 时写工具根本不会注册（整个服务退化成只读）。
+
+#### Cloudflare 隧道
+
+```bash
+cloudflared tunnel create douyin           # 一次性
+cloudflared tunnel route dns douyin douyin.vbvcv.xyz
+cloudflared tunnel --config ~/.cloudflared/config-douyin.yaml run
+```
+
+`~/.cloudflared/config-douyin.yaml`：
+
+```yaml
+tunnel: douyin
+credentials-file: /Users/<you>/.cloudflared/<uuid>.json
+ingress:
+  - hostname: douyin.vbvcv.xyz
+    service: http://127.0.0.1:8765
+  - service: http_status:404
+```
+
+#### 排障
+
+- `401 Authentication required`：客户端没拿到 token，检查 `/mcp` 响应头里的
+  `resource_metadata` 是否公网可达。
+- 工具报 `Uifid Not Found` 之类：`.env` 的 `DY_COOKIES` 失效了，先调 `auth_status` 确认。
+- 公网 502：本地服务没起（`lsof -iTCP:8765`），或隧道 ingress 端口写错。
+- 登录页提示“授权链接已过期”：链接有效期 10 分钟，回客户端重新发起连接。
+
 
 ### 🗝️注意事项
 - `main.py` 是爬虫入口，可根据需求自行修改调用
@@ -190,6 +346,7 @@ python quick_publish.py
 - `dy_apis/douyin_creator_api.py` 包含创作者中心上传 / 发布作品接口
 - `dy_apis/login_api.py` 包含扫码、手机号验证码登录逻辑
 - `dy_live/pk.py` 包含直播间 PK 事件解析
+- `mcp_server/` 是远程 MCP 服务（OAuth 登录 + 工具包装）；直播**实时监听**没有做成 MCP 工具（长连接不适合请求-响应模型），仍用 `python -m dy_live.server`
 
 
 ## 🍥日志
@@ -214,6 +371,10 @@ python quick_publish.py
 | 26/09/20 | - 对齐直播间弹幕发送与作品评论发布接口 |
 | 26/09/27 | - 修复视频下载（CDN 需带 Referer，之前会把 403 页面存成 mp4）；单个作品下载失败时跳过，不再中断整批 |
 | 26/11/23 | - 评论发布支持图片表情（`publish_comment` 新增 `sticker` 参数，字段对齐 PC Web 前端） |
+| 26/11/24 | - 新增远程 MCP 服务：OAuth 2.0 登录 + 56 个工具 + Cloudflare 隧道（douyin.vbvcv.xyz），已有入口零改动；私信支持实时接收；评论支持 @ 提及（`text_extra`） |
+| 26/11/24 | - MCP 工具补齐到 79 个：评论/搜索/粉丝/通知的游标分页、私信图集/网页/名片/任意卡片、创作者合集/热点/章节/封面参数、批量下载；修正 `visibility` 文档（1 = 仅自己可见）、`poi` 必须是对象、`douyin_api_call` 的只读标注与 `MCP_ENABLE_WRITE` 绕过问题 |
+| 26/11/24 | - 私信支持群消息回复：新增会话列表（`im_conversations`，单聊/群聊分开查）、会话 ticket（`im_conversation_ticket`）、按会话发送（`im_send_text_to_conversation`，`conversation_type=2` 即群聊）；发送链路 `conversation_type` 参数化，不再写死 1 |
+| 26/11/24 | - 群消息补齐 @人 / 表情 / 引用回复（工具数 84）：`im_conversation_members`（成员 uid）、`emoji_list`（表情 token）、`sticker_favorites` / `sticker_collect`（收藏表情包列表、收藏/取消收藏）、`im_send_sticker_to_conversation`（群发表情包，`awe_type` 501=GIF / 510=消息贴纸）、`im_send_text_to_conversation` 支持 `mentions` / `emojis` / `reply`；回复走 `aweType=703 + ref_msg_info`；私信 type=5 事件补充 `image_id / uri / package_id` 便于直接收藏 |
 
 ## 🤝 欢迎贡献 PR
 
