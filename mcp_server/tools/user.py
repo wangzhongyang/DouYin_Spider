@@ -256,11 +256,24 @@ def notices_page(
 
 
 @read_tool
-def feed(count: str = "20", refresh_index: str = "2") -> dict:
-    """获取推荐流。
+def feed(refresh_index: str = "2", tag_id: str = "", pull_type: str | None = None) -> dict:
+    """获取首页推荐流（返回完整 aweme_list，约 100–200KB）。
+
+    **没有翻页参数**：推荐流没有 cursor/offset，每次调用都会重新推荐一批，
+    同样的参数重复调用也几乎不会重复（实测同参数连续两次 0 重合）。
+    想要更多内容就多调几次，客户端按 aweme_id 自行去重。
 
     Args:
-        count: 拉取数量，默认 20。
-        refresh_index: 刷新序号，默认 "2"。
+        refresh_index: 刷新序号，从 "1" 开始，默认 "2"。
+            条数由它决定：实测 1 约 2 条，>=2 约 6 条，20/50 仍是 6 条。
+            连续拉取时建议每次递增，模拟浏览器刷新，降低风控概率。
+        tag_id: 频道 tag id，默认空字符串表示推荐流；非空取对应频道内容。
+        pull_type: 拉取类型，"0"=刷新，"2"=加载更多，"8"=预缓存。
+            留空（默认）时按 refresh_index 推导：1 -> 0，>1 -> 2，与 PC Web 前端一致。
     """
-    return DouyinAPI.get_feed(douyin_auth(), count, refresh_index)
+    return DouyinAPI.get_feed(
+        douyin_auth(),
+        refresh_index=refresh_index,
+        tag_id=tag_id,
+        pull_type=pull_type,
+    )

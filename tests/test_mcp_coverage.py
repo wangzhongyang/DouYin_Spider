@@ -762,7 +762,7 @@ def test_build_text_content_detects_self_reply(monkeypatch):
     assert json.loads(ref["hint"])["scene_type"] == 1  # 回复别人
 
 
-def test_feed_uses_current_tab_feed_endpoint(monkeypatch):
+def _feed_capture(monkeypatch):
     from types import SimpleNamespace
 
     captured: dict = {}
@@ -776,6 +776,7 @@ def test_feed_uses_current_tab_feed_endpoint(monkeypatch):
             return {"status_code": 0, "aweme_list": []}
 
     def fake_get(url, **kwargs):
+        captured.clear()
         captured.update(url=url, **kwargs)
         return FakeResponse()
 
@@ -784,9 +785,32 @@ def test_feed_uses_current_tab_feed_endpoint(monkeypatch):
         cookie={"UIFID": "u", "s_v_web_id": "fp"},
         webid="w", msToken="ms",
     )
-    DouyinAPI.get_feed(auth, count="10", refresh_index="2")
+    return auth, captured
+
+
+def test_feed_uses_current_tab_feed_endpoint(monkeypatch):
+    auth, captured = _feed_capture(monkeypatch)
+    DouyinAPI.get_feed(auth, refresh_index="2")
     assert captured["url"].endswith("/aweme/v1/web/tab/feed/")
     params = captured["params"]
     assert params["aid"] == "6383" and params["channel"] == "channel_pc_web"
-    assert params["tag_id"] == "" and params["count"] == "10"
-    assert params["refresh_index"] == "2" and params["video_type_select"] == "1"
+    assert params["tag_id"] == "" and params["refresh_index"] == "2"
+    assert params["video_type_select"] == "1" and params["globalwid"] == ""
+    # 服务端忽略 count，参数里不应再带
+    assert "count" not in params
+
+
+def test_feed_derives_pull_type_from_refresh_index(monkeypatch):
+    auth, captured = _feed_capture(monkeypatch)
+    DouyinAPI.get_feed(auth, refresh_index="1")
+    assert captured["params"]["pull_type"] == "0"  # 首发刷新
+    DouyinAPI.get_feed(auth, refresh_index="2")
+    assert captured["params"]["pull_type"] == "2"  # 后续加载更多
+
+
+def test_feed_accepts_explicit_pull_type_and_tag(monkeypatch):
+    auth, captured = _feed_capture(monkeypatch)
+    DouyinAPI.get_feed(auth, refresh_index="3", tag_id="3002036", pull_type="8")
+    params = captured["params"]
+    assert params["pull_type"] == "8"  # 显式值优先，不被 refresh_index 覆盖
+    assert params["tag_id"] == "3002036"

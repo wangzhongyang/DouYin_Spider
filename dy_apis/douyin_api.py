@@ -1584,28 +1584,33 @@ class DouyinAPI:
         return notice_list
 
     @staticmethod
-    def get_feed(auth, count='20', refresh_index='2', **kwargs):
+    def get_feed(auth, refresh_index='2', tag_id='', pull_type=None, **kwargs):
         """获取首页推荐流（PC Web `tab/feed`）。
 
-        :param count: 期望数量；服务端按 refresh_index 批量下发，实际条数可能少于 count。
-        :param refresh_index: 刷新序号，从 1 开始；实测 2 一次返回约 6 条，1 只返回 2 条。
-        :param tag_id: 频道 tag，空字符串为推荐。
-        :param video_type_select: 1 视频流（默认）。
-        :param pull_type / globalwid: 翻页/灰度参数，默认不传或空。
+        - 推荐流没有 cursor/offset：每次调用都会重新推荐一批，同参数重复调用
+          也会返回不同内容（实测两次完全相同参数 0 重合），客户端按 aweme_id 自行去重。
+        - ``refresh_index`` 从 1 开始；实测 1 约 2 条、>=2 约 6 条，建议每次调用递增。
+        - ``tag_id`` 空字符串表示推荐；非空为网页频道 tag id。
+        - ``pull_type``：0 刷新 / 2 加载更多 / 8 预缓存；留空时按
+          ``refresh_index`` 推导（1 -> 0，>1 -> 2），与前端 module/feed 的行为一致。
+        - 服务端会忽略 ``count``，返回条数由 refresh_index 决定，因此不再暴露 count。
         """
+        index = max(1, int(refresh_index))
+        if pull_type is None or pull_type == '':
+            pull = 2 if index > 1 else 0
+        else:
+            pull = int(pull_type)
         api = "/aweme/v1/web/tab/feed/"
         refer = "https://www.douyin.com/?recommend=1"
         headers = HeaderBuilder().build(HeaderType.GET)
         headers.set_referer(refer)
         params = Params()
         params.with_platform(round_trip_time='0')
-        params.add_param("tag_id", kwargs.get("tag_id", ""))
-        params.add_param("count", str(count))
-        params.add_param("refresh_index", str(refresh_index))
-        params.add_param("video_type_select", str(kwargs.get("video_type_select", 1)))
-        params.add_param("globalwid", kwargs.get("globalwid", ""))
-        if kwargs.get("pull_type") is not None:
-            params.add_param("pull_type", str(kwargs["pull_type"]))
+        params.add_param("tag_id", tag_id or "")
+        params.add_param("refresh_index", str(index))
+        params.add_param("video_type_select", '1')
+        params.add_param("globalwid", "")
+        params.add_param("pull_type", str(pull))
         params.with_web_id(auth, refer)
         params.with_uifid(auth)
         params.with_verify_fp(auth)
