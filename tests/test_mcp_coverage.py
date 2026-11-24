@@ -760,3 +760,33 @@ def test_build_text_content_detects_self_reply(monkeypatch):
     reply["uid"] = 7
     _content, _mentioned, ref = DouyinAPI.build_text_content("x", reply=reply, auth=auth)
     assert json.loads(ref["hint"])["scene_type"] == 1  # 回复别人
+
+
+def test_feed_uses_current_tab_feed_endpoint(monkeypatch):
+    from types import SimpleNamespace
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"status_code":0,"aweme_list":[]}'
+        headers: dict = {}
+
+        def json(self):
+            return {"status_code": 0, "aweme_list": []}
+
+    def fake_get(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr("dy_apis.douyin_api.requests.get", fake_get)
+    auth = SimpleNamespace(
+        cookie={"UIFID": "u", "s_v_web_id": "fp"},
+        webid="w", msToken="ms",
+    )
+    DouyinAPI.get_feed(auth, count="10", refresh_index="2")
+    assert captured["url"].endswith("/aweme/v1/web/tab/feed/")
+    params = captured["params"]
+    assert params["aid"] == "6383" and params["channel"] == "channel_pc_web"
+    assert params["tag_id"] == "" and params["count"] == "10"
+    assert params["refresh_index"] == "2" and params["video_type_select"] == "1"

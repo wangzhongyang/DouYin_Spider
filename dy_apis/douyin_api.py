@@ -1585,65 +1585,36 @@ class DouyinAPI:
 
     @staticmethod
     def get_feed(auth, count='20', refresh_index='2', **kwargs):
+        """获取首页推荐流（PC Web `tab/feed`）。
+
+        :param count: 期望数量；服务端按 refresh_index 批量下发，实际条数可能少于 count。
+        :param refresh_index: 刷新序号，从 1 开始；实测 2 一次返回约 6 条，1 只返回 2 条。
+        :param tag_id: 频道 tag，空字符串为推荐。
+        :param video_type_select: 1 视频流（默认）。
+        :param pull_type / globalwid: 翻页/灰度参数，默认不传或空。
         """
-        获取首页推荐视频
-        :param auth: DouyinAuth object.
-        :param count: 数量.
-        :param refresh_index: 刷新索引.
-        :return: JSON.
-        """
-        api = "/aweme/v1/web/module/feed/"
+        api = "/aweme/v1/web/tab/feed/"
+        refer = "https://www.douyin.com/?recommend=1"
         headers = HeaderBuilder().build(HeaderType.GET)
-        refer = "https://www.douyin.com/"
         headers.set_referer(refer)
         params = Params()
-        params.add_param("device_platform", 'webapp')
-        params.add_param("aid", '6383')
-        params.add_param("channel", 'channel_pc_web')
-        params.add_param("module_id", '3003101')
-        params.add_param("count", count)
-        params.add_param("filterGids", '')
-        params.add_param("presented_ids", '')
-        params.add_param("refresh_index", refresh_index)
-        params.add_param("refer_id", '')
-        params.add_param("refer_type", '10')
-        params.add_param("awemePcRecRawData", '{"is_client":false}')
-        params.add_param("Seo-Flag", '0')
-        params.add_param("install_time", '1715480185')
-        params.add_param("pc_client_type", '1')
-        params.add_param("update_version_code", '170400')
-        params.add_param("version_code", '170400')
-        params.add_param("version_name", '17.4.0')
-        params.add_param("cookie_enabled", 'true')
-        params.add_param("screen_width", get_profile()["screen_width"])
-        params.add_param("screen_height", get_profile()["screen_height"])
-        params.add_param("browser_language", 'zh-CN')
-        params.add_param("browser_platform", 'Win32')
-        params.add_param("browser_name", get_profile()["browser_name"])
-        params.add_param("browser_version", get_profile()["browser_version"])
-        params.add_param("browser_online", 'true')
-        params.add_param("engine_name", 'Blink')
-        params.add_param("engine_version", get_profile()["engine_version"])
-        params.add_param("os_name", 'Windows')
-        params.add_param("os_version", '10')
-        params.add_param("cpu_core_num", get_profile()["cpu_core_num"])
-        params.add_param("device_memory", get_profile()["device_memory"])
-        params.add_param("platform", 'PC')
-        params.add_param("downlink", '10')
-        params.add_param("effective_type", '4g')
-        params.add_param("round_trip_time", '100')
+        params.with_platform(round_trip_time='0')
+        params.add_param("tag_id", kwargs.get("tag_id", ""))
+        params.add_param("count", str(count))
+        params.add_param("refresh_index", str(refresh_index))
+        params.add_param("video_type_select", str(kwargs.get("video_type_select", 1)))
+        params.add_param("globalwid", kwargs.get("globalwid", ""))
+        if kwargs.get("pull_type") is not None:
+            params.add_param("pull_type", str(kwargs["pull_type"]))
         params.with_web_id(auth, refer)
+        params.with_uifid(auth)
+        params.with_verify_fp(auth)
         params.add_param("msToken", auth.msToken)
         params.with_a_bogus()
-        params.add_param("verifyFp", auth.cookie['s_v_web_id'])
-        params.add_param("fp", auth.cookie['s_v_web_id'])
-
-        res = requests.get(f'{DouyinAPI.douyin_url}{api}', headers=headers.get(), params=params.get(),
-                           cookies=auth.cookie, verify=False)
-        check_risk_response(res)
-        return res.json()
-
-
+        resp = requests.get(f'{DouyinAPI.douyin_url}{api}', headers=headers.get(),
+                            params=params.get(), cookies=auth.cookie, verify=False)
+        check_risk_response(resp)
+        return resp.json()
 
     @staticmethod
     def _get_live_rank(auth, api: str, room_id: str, endpoint_params,
