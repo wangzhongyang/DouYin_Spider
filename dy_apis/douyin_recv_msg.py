@@ -2,7 +2,6 @@ import hashlib
 import json
 import time
 
-import websocket
 from websocket import WebSocketApp
 
 from dy_apis.douyin_api import DouyinAPI
@@ -27,9 +26,9 @@ class DouyinRecvMsg:
         self.received = 0
         self.auth = auth
         self.ws = None
-        self._should_reconnect = False   # on_error 打标记，真正重连在 start() 的循环里
         self._stopped = False            # stop() 置位，用来跳出重连循环
-        self._opened = False             # 本轮连接是否成功建立过（用来重置退避）
+        self._opened = False             # 当前连接是否打开（im_listen_status 的 connected 用它）
+        self._ever_opened = False        # 本轮是否连上过（用来重置退避）
         deviceId = DouyinAPI.get_device_id(auth=self.auth)
         accessKey = f'{self.fpId + self.appKey + deviceId}f8a69f1719916z'
         accessKey = hashlib.md5(accessKey.encode(encoding='UTF-8')).hexdigest()
@@ -46,6 +45,7 @@ class DouyinRecvMsg:
 
     def on_open(self, ws):
         self._opened = True
+        self._ever_opened = True
         print("WebSocket connection open.")
 
     def _emit(self, event: dict):
@@ -118,19 +118,13 @@ class DouyinRecvMsg:
         print("\033[31m### error ###")
         print(error)
         print("### ===error=== ###\033[m")
-        # 原写法是 `A or B and self.auto_reconnect`，按优先级等于 `A or (B and ...)`，
-        # 于是 ConnectionRefusedError 会绕过 auto_reconnect 开关无条件重连。
-        # 另外用 type()== 判断会漏掉子类，改 isinstance。
-        if not self.auto_reconnect:
-            return
-        if isinstance(error, (ConnectionRefusedError,
-                              websocket.WebSocketConnectionClosedException)):
-            # 这里只打标记。以前是直接调 self.start()，而 start() 内部是阻塞的
-            # run_forever —— 每次重连都往调用栈上再压一层，不是循环，
-            # 断线次数多了栈会一直涨直到 RecursionError。真正的重连交给 start()。
-            self._should_reconnect = True
+        # 这里只记录。是否重连统一由 start() 的循环判断：以前只有在
+        # ConnectionRefusedError / ConnectionClosedException 上打标记才重连，
+        # 其它错误（包括服务端正常 close 帧，on_error 根本不触发）会让
+        # run_forever 返回后循环直接退出，监听线程静默死掉、不再收消息。
 
     def on_close(self, ws, close_status_code, close_msg):
+        self._opened = False
         print("\033[31m### closed ###")
         print(f"status_code: {close_status_code}, msg: {close_msg}")
         print("### ===closed=== ###\033[m")
@@ -164,16 +158,22 @@ class DouyinRecvMsg:
         )
 
     def start(self):
-        """阻塞运行；断线按退避重连。重连是**循环**，不是递归压栈。"""
+        """阻塞运行；断线按退避重连，直到 stop() 或 auto_reconnect=False。
+
+        重连是**循环**，不是递归压栈。判断依据只看“是否被主动停止”，
+        不再依赖具体异常类型：服务端正常 close（on_error 不触发）同样要重连。
+        """
         backoff = self.RECONNECT_BACKOFF_START
-        while not self._stopped:
-            self._should_reconnect = False
-            self._opened = False
+        while not self._stopped and self.auto_reconnect:
+            self._ever_opened = False
             self.ws = self._new_ws()
             try:
                 self.ws.run_forever(origin='https://www.douyin.com')
             except KeyboardInterrupt:
-                self.ws.close()
+                try:
+                    self.ws.close()
+                except Exception:
+                    pass
                 break
             except Exception as e:
                 print(f"\033[31m### run_forever 异常: {type(e).__name__}: {e} ###\033[m")
@@ -181,9 +181,9 @@ class DouyinRecvMsg:
                     self.ws.close()
                 except Exception:
                     pass
-            if self._stopped or not (self.auto_reconnect and self._should_reconnect):
+            if self._stopped or not self.auto_reconnect:
                 break
-            if self._opened:
+            if self._ever_opened:
                 # 这轮连上过，说明不是持续性故障，退避重置
                 backoff = self.RECONNECT_BACKOFF_START
             print(f"\033[33m### {backoff:.0f} 秒后重连 ###\033[m")

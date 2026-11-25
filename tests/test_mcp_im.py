@@ -263,3 +263,69 @@ def test_ws_sticker_event_keeps_raw_content():
     assert event["url"] == "https://cdn/x.webp"
     assert event["package_id"] == 0
     assert event["raw_content"] == sticker
+
+
+def _bare_receiver():
+    """不跑 __init__（会发 get_device_id 请求），手工拼一个接收器。"""
+    from dy_apis.douyin_recv_msg import DouyinRecvMsg
+
+    receiver = DouyinRecvMsg.__new__(DouyinRecvMsg)
+    receiver.auto_reconnect = True
+    receiver.on_event = None
+    receiver.received = 0
+    receiver.auth = None
+    receiver.ws = None
+    receiver._stopped = False
+    receiver._opened = False
+    receiver._ever_opened = False
+    receiver.RECONNECT_BACKOFF_START = 0
+    receiver.RECONNECT_BACKOFF_MAX = 0
+    return receiver
+
+
+def test_clean_close_marks_disconnected():
+    receiver = _bare_receiver()
+    receiver.on_open(None)
+    assert receiver._opened is True
+    receiver.on_close(None, 1000, "bye")
+    assert receiver._opened is False, "关闭后 connected 必须变 False，否则 im_listen_status 会撒谎"
+
+
+def test_reconnects_after_clean_close(monkeypatch):
+    """服务端正常 close（on_error 不触发）也必须重连，不能静默退出。"""
+    receiver = _bare_receiver()
+    calls: list[int] = []
+
+    class FakeWS:
+        def run_forever(self, **_kwargs):
+            calls.append(1)
+            receiver.on_open(self)
+            receiver.on_close(self, 1000, "server closed")  # 无 error 回调
+            if len(calls) >= 3:
+                receiver.stop()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(receiver, "_new_ws", lambda: FakeWS())
+    receiver.start()
+    assert len(calls) == 3, "正常关闭后要循环重连，而不是只连一次"
+    assert receiver._stopped is True
+
+
+def test_stop_prevents_further_reconnect(monkeypatch):
+    receiver = _bare_receiver()
+    calls: list[int] = []
+
+    class FakeWS:
+        def run_forever(self, **_kwargs):
+            calls.append(1)
+            receiver.on_open(self)
+            receiver.stop()  # 第一次就连上后主动停
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(receiver, "_new_ws", lambda: FakeWS())
+    receiver.start()
+    assert len(calls) == 1
