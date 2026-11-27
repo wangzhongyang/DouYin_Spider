@@ -6,6 +6,7 @@ import threading
 import time
 
 import pytest
+from websocket import ABNF
 from mcp_server.im_manager import IMMessageManager
 
 
@@ -352,26 +353,44 @@ def test_connection_uses_ws_heartbeat(monkeypatch):
     assert receiver.PING_INTERVAL > 0 and receiver.PING_TIMEOUT > 0
 
 
-def test_connection_is_refreshed_after_max_age(monkeypatch):
-    """服务端会让订阅静默失效而 TCP 仍已连接，到寿命要主动换新连接。"""
+def test_sends_app_level_heartbeat(monkeypatch):
+    """PC Web 每 30 秒发 PushFrame{service=9999,method=1,payloadType='hb'}，
+    不发会被服务端静默退订（2026-11-27 实录）。"""
+    from static import Live_pb2
+
     receiver = _bare_receiver()
-    receiver.MAX_CONNECTION_AGE = 0.2
-    connections: list[int] = []
+    receiver.HEARTBEAT_INTERVAL = 0.05
+    sent: list[tuple[bytes, int]] = []
 
     class FakeWS:
-        def __init__(self):
-            self.closed = threading.Event()
+        def send(self, data, opcode=None):
+            sent.append((data, opcode))
 
         def run_forever(self, **_kwargs):
-            connections.append(1)
             receiver.on_open(self)
-            self.closed.wait(5)  # 只有 close() 能结束本轮
-            if len(connections) >= 3:
-                receiver.stop()
+            time.sleep(0.24)
+            receiver.on_close(self, 1000, "bye")
+            receiver.stop()
 
         def close(self):
-            self.closed.set()
+            pass
 
     monkeypatch.setattr(receiver, "_new_ws", lambda: FakeWS())
     receiver.start()
-    assert len(connections) == 3, "到 MAX_CONNECTION_AGE 必须主动重连刷新订阅"
+
+    assert len(sent) >= 3, "应该持续发心跳"
+    hearts = []
+    for data, opcode in sent:
+        frame = Live_pb2.PushFrame()
+        frame.ParseFromString(data)
+        hearts.append((frame, opcode))
+
+    first, opcode = hearts[0]
+    assert opcode == ABNF.OPCODE_BINARY
+    assert (first.seqId, first.logId, first.service, first.method, first.payloadType) == (1, 1, 9999, 1, "hb")
+    assert [f.seqId for f, _ in hearts[:3]] == [1, 2, 3], "seqId 必须自增"
+
+    # 关连接后要停心跳
+    count = len(sent)
+    time.sleep(0.15)
+    assert len(sent) == count, "on_close 之后不能再发心跳"
