@@ -1,5 +1,6 @@
 import hashlib
 import json
+import threading
 import time
 
 from websocket import WebSocketApp
@@ -18,6 +19,14 @@ class DouyinRecvMsg:
     # 重连退避：1 秒起，指数增长，上限 30 秒
     RECONNECT_BACKOFF_START = 1.0
     RECONNECT_BACKOFF_MAX = 30.0
+    # 心跳：空闲连接会被中间设备（NAT/代理）静默丢弃而不发 FIN，
+    # 20 秒一次 ping、10 秒内收不到 pong 就判定断线重连。
+    PING_INTERVAL = 20
+    PING_TIMEOUT = 10
+    # 连接最长存活时间：服务端会在 TCP 不断的情况下静默让订阅失效
+    # （2026-11-27 实测：18:41 后 socket 仍是 ESTABLISHED，但再没有推送，
+    # 新连接立刻能收到）。到点主动重连换取新订阅，代价是约 1 秒的断档。
+    MAX_CONNECTION_AGE = 1800
 
     def __init__(self, auth: DouyinAuth, auto_reconnect=True, on_event=None):
         self.auto_reconnect = auto_reconnect
@@ -162,13 +171,25 @@ class DouyinRecvMsg:
 
         重连是**循环**，不是递归压栈。判断依据只看“是否被主动停止”，
         不再依赖具体异常类型：服务端正常 close（on_error 不触发）同样要重连。
+
+        连接带心跳（PING_INTERVAL/PING_TIMEOUT），并在存活 MAX_CONNECTION_AGE
+        后主动换一条新连接 —— 服务端可能让订阅静默失效而 TCP 仍显示已连接。
         """
         backoff = self.RECONNECT_BACKOFF_START
         while not self._stopped and self.auto_reconnect:
             self._ever_opened = False
             self.ws = self._new_ws()
+            age_timer = None
+            if self.MAX_CONNECTION_AGE:
+                age_timer = threading.Timer(self.MAX_CONNECTION_AGE, self._refresh)
+                age_timer.daemon = True
+                age_timer.start()
             try:
-                self.ws.run_forever(origin='https://www.douyin.com')
+                self.ws.run_forever(
+                    origin='https://www.douyin.com',
+                    ping_interval=self.PING_INTERVAL,
+                    ping_timeout=self.PING_TIMEOUT,
+                )
             except KeyboardInterrupt:
                 try:
                     self.ws.close()
@@ -181,6 +202,9 @@ class DouyinRecvMsg:
                     self.ws.close()
                 except Exception:
                     pass
+            finally:
+                if age_timer is not None:
+                    age_timer.cancel()
             if self._stopped or not self.auto_reconnect:
                 break
             if self._ever_opened:
@@ -192,6 +216,17 @@ class DouyinRecvMsg:
             except KeyboardInterrupt:
                 break
             backoff = min(backoff * 2, self.RECONNECT_BACKOFF_MAX)
+
+    def _refresh(self):
+        """到寿命主动断开，让 start() 的循环换一条新连接。"""
+        ws = self.ws
+        if ws is None:
+            return
+        print("\033[33m### 连接到期，主动重连刷新订阅 ###\033[m")
+        try:
+            ws.close()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

@@ -329,3 +329,49 @@ def test_stop_prevents_further_reconnect(monkeypatch):
     monkeypatch.setattr(receiver, "_new_ws", lambda: FakeWS())
     receiver.start()
     assert len(calls) == 1
+
+
+def test_connection_uses_ws_heartbeat(monkeypatch):
+    """空闲连接会被 NAT/代理静默丢弃，必须带 WS 心跳才能发现断线。"""
+    receiver = _bare_receiver()
+    seen: dict = {}
+
+    class FakeWS:
+        def run_forever(self, **kwargs):
+            seen.update(kwargs)
+            receiver.on_open(self)
+            receiver.stop()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(receiver, "_new_ws", lambda: FakeWS())
+    receiver.start()
+    assert seen["ping_interval"] == receiver.PING_INTERVAL
+    assert seen["ping_timeout"] == receiver.PING_TIMEOUT
+    assert receiver.PING_INTERVAL > 0 and receiver.PING_TIMEOUT > 0
+
+
+def test_connection_is_refreshed_after_max_age(monkeypatch):
+    """服务端会让订阅静默失效而 TCP 仍已连接，到寿命要主动换新连接。"""
+    receiver = _bare_receiver()
+    receiver.MAX_CONNECTION_AGE = 0.2
+    connections: list[int] = []
+
+    class FakeWS:
+        def __init__(self):
+            self.closed = threading.Event()
+
+        def run_forever(self, **_kwargs):
+            connections.append(1)
+            receiver.on_open(self)
+            self.closed.wait(5)  # 只有 close() 能结束本轮
+            if len(connections) >= 3:
+                receiver.stop()
+
+        def close(self):
+            self.closed.set()
+
+    monkeypatch.setattr(receiver, "_new_ws", lambda: FakeWS())
+    receiver.start()
+    assert len(connections) == 3, "到 MAX_CONNECTION_AGE 必须主动重连刷新订阅"
